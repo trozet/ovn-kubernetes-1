@@ -164,9 +164,9 @@ func (ovn *Controller) getLogicalSwitchesForLoadBalancer(lb string) ([]string, e
 // TODO: Add unittest for function.
 func (ovn *Controller) generateACLName(lb string, sourceIP string, sourcePort int32) string {
 	aclName := fmt.Sprintf("%s-%s:%d", lb, sourceIP, sourcePort)
-	aclName = strings.ReplaceAll(aclName, ":", "\\:")
+	aclNameTmp := strings.ReplaceAll(aclName, ":", "\\:")
 	// ACL names are limited to 63 characters
-	if len(aclName) > 63 {
+	if len(aclNameTmp) > 63 {
 		var ipPortLen int
 		srcPortStr := fmt.Sprintf("%d", sourcePort)
 		if utilnet.IsIPv6String(sourceIP) {
@@ -190,9 +190,12 @@ func (ovn *Controller) generateACLName(lb string, sourceIP string, sourcePort in
 		tmpLb := lb[:lbTrim]
 		klog.Infof("Limiting ACL Name from %s to %s-%s:%d to keep under 63 characters", aclName, tmpLb, sourceIP, sourcePort)
 		aclName = fmt.Sprintf("%s-%s:%d", tmpLb, sourceIP, sourcePort)
-		aclName = strings.ReplaceAll(aclName, ":", "\\:")
 	}
 	return aclName
+}
+
+func (ovn *Controller) generateACLNameForOVNCommand(lb string, sourceIP string, sourcePort int32) string {
+	return strings.ReplaceAll(ovn.generateACLName(lb, sourceIP, sourcePort), ":", "\\:")
 }
 
 func (ovn *Controller) createLoadBalancerRejectACL(lb string, sourceIP string, sourcePort int32, proto kapi.Protocol) (string, error) {
@@ -221,7 +224,7 @@ func (ovn *Controller) createLoadBalancerRejectACL(lb string, sourceIP string, s
 	}
 	vip := util.JoinHostPortInt32(sourceIP, sourcePort)
 	// NOTE: doesn't use vip, to avoid having brackets in the name with IPv6
-	aclName := ovn.generateACLName(lb, sourceIP, sourcePort)
+	aclName := ovn.generateACLNameForOVNCommand(lb, sourceIP, sourcePort)
 	// If ovn-k8s was restarted, we lost the cache, and an ACL may already exist in OVN. In that case we need to check
 	// using ACL name
 	aclUUID, stderr, err := util.RunOVNNbctl("--data=bare", "--no-heading", "--columns=_uuid", "find", "acl",
@@ -289,7 +292,7 @@ func (ovn *Controller) deleteLoadBalancerRejectACL(lb, vip string) {
 }
 
 func (ovn *Controller) removeStaleRejectACL(lb, ip string, port int32) {
-	aclName := ovn.generateACLName(lb, ip, port)
+	aclName := ovn.generateACLNameForOVNCommand(lb, ip, port)
 	aclUUID, stderr, err := util.RunOVNNbctl("--data=bare", "--no-heading", "--columns=_uuid", "find", "acl",
 		fmt.Sprintf("name=%s", aclName))
 	if err != nil {
