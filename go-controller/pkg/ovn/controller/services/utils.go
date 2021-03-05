@@ -2,16 +2,14 @@ package services
 
 import (
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
-	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
-	"net"
-	"strconv"
-	"strings"
-
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/acl"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/gateway"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/loadbalancer"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
 	"github.com/pkg/errors"
+	"net"
+	"strconv"
 
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1beta1"
@@ -147,7 +145,7 @@ func deleteVIPsFromOVN(vips sets.String, st *serviceTracker, name, namespace, cl
 				// TODO: why continue? should we error and requeue and retry?
 				continue
 			}
-			workerNode := strings.TrimPrefix(gatewayRouter, "GR_")
+			workerNode := util.GetWorkerFromGatewayRouter(gatewayRouter)
 			workerLB, err := loadbalancer.GetWorkerLoadBalancer(workerNode, proto)
 			if err != nil {
 				klog.Errorf("Worker switch %s does not have load balancer (%v)", workerNode, err)
@@ -207,7 +205,7 @@ func createPerNodeVIPs(svcIPs []string, protocol v1.Protocol, sourcePort int32, 
 		}
 
 		if config.Gateway.Mode == config.GatewayModeShared {
-			workerNode := strings.TrimPrefix(gatewayRouter, "GR_")
+			workerNode := util.GetWorkerFromGatewayRouter(gatewayRouter)
 			workerLB, err := loadbalancer.GetWorkerLoadBalancer(workerNode, protocol)
 			if err != nil {
 				klog.Errorf("Worker switch %s does not have load balancer (%v)", workerNode, err)
@@ -250,7 +248,7 @@ func deleteNodeVIPs(svcIPs []string, protocol v1.Protocol, sourcePort int32) err
 		}
 		loadBalancers = append(loadBalancers, gatewayLB)
 		if config.Gateway.Mode == config.GatewayModeShared {
-			workerNode := strings.TrimPrefix(gatewayRouter, "GR_")
+			workerNode := util.GetWorkerFromGatewayRouter(gatewayRouter)
 			workerLB, err := loadbalancer.GetWorkerLoadBalancer(workerNode, protocol)
 			if err != nil {
 				klog.Errorf("Worker switch %s does not have load balancer (%v)", workerNode, err)
