@@ -110,7 +110,7 @@ func (uc *upgradeController) Run(stopCh <-chan struct{}, informerStop chan struc
 		select {
 		case <-ticker.C:
 			if uc.processNextWorkItem() {
-				klog.Info("Masters have completed upgrade from %d to %d",
+				klog.Infof("Masters have completed upgrade from topology %d to %d",
 					uc.initialTopoVersion, ovntypes.OvnCurrentTopologyVersion)
 				ticker.Stop()
 				informerStop <- struct{}{}

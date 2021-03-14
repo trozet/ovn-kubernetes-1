@@ -293,7 +293,7 @@ func (n *OvnNode) Start(wg *sync.WaitGroup) error {
 				}
 			}
 			// need to run upgrade controller
-			var informerStop chan struct{}
+			informerStop := make(chan struct{})
 			informerFactory.Start(informerStop)
 			go func() {
 				if err := upgradeController.Run(n.stopChan, informerStop); err != nil {
