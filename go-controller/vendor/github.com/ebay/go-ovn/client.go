@@ -291,6 +291,7 @@ type ovndb struct {
 	tlsConfig    *tls.Config
 	reconn       bool
 	ticker       *time.Ticker
+	currentTxn   *string
 }
 
 func connect(c *ovndb) (err error) {
@@ -325,7 +326,10 @@ func connect(c *ovndb) (err error) {
 	}
 
 	// We do the initial dump and populate the cache, we have the mutex
-	c.populateCache(*initial)
+	c.populateCache2(*initial)
+
+	// TODO(trozet) update currentTxn now
+	c.currentTxn
 	return nil
 }
 
@@ -341,6 +345,8 @@ func NewClient(cfg *Config) (Client, error) {
 		return nil, fmt.Errorf("Valid db names are: %s and %s", DBNB, DBSB)
 	}
 
+	txn := "00000000-0000-0000-0000-000000000000"
+
 	ovndb := &ovndb{
 		signalCB:     cfg.SignalCB,
 		disconnectCB: cfg.DisconnectCB,
@@ -350,6 +356,7 @@ func NewClient(cfg *Config) (Client, error) {
 		tlsConfig:    cfg.TLSConfig,
 		reconn:       cfg.Reconnect,
 		ticker:       time.NewTicker(time.Second/25),
+		currentTxn:   &txn,
 	}
 
 	err := connect(ovndb)
@@ -405,7 +412,7 @@ func (c *ovndb) filterTablesFromSchema() []string {
 	return schemaTables
 }
 
-func (c *ovndb) MonitorTables(jsonContext interface{}) (*libovsdb.TableUpdates, error) {
+func (c *ovndb) MonitorTables(jsonContext interface{}) (*libovsdb.TableUpdates2, error) {
 	tables := c.filterTablesFromSchema()
 	// verify whether user specified table and its columns are legit
 	if len(c.tableCols) != 0 {
@@ -443,7 +450,7 @@ func (c *ovndb) MonitorTables(jsonContext interface{}) (*libovsdb.TableUpdates, 
 				Modify:  true,
 			}}
 	}
-	return c.client.Monitor(c.db, jsonContext, requests)
+	return c.client.Monitor(c.db, jsonContext, requests, c.currentTxn)
 }
 
 // TODO return proper error

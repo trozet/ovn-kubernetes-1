@@ -100,6 +100,9 @@ func newRPC2Client(conn net.Conn) (*OvsdbClient, error) {
 	c.SetBlocking(true)
 	c.Handle("echo", echo)
 	c.Handle("update", update)
+	c.Handle("update2", update2)
+	c.Handle("update3", update3)
+
 	go c.Run()
 	go handleDisconnectNotification(c)
 
@@ -154,6 +157,8 @@ type NotificationHandler interface {
 	// RFC 7047 section 4.1.6 Update Notification
 	Update(context interface{}, tableUpdates TableUpdates)
 
+	Update2(context interface{}, tableUpdates2 TableUpdates2)
+
 	// RFC 7047 section 4.1.9 Locked Notification
 	Locked([]interface{})
 
@@ -193,6 +198,8 @@ func update(client *rpc2.Client, params []interface{}, reply *interface{}) error
 	if !ok {
 		return errors.New("Invalid Update message")
 	}
+
+	// really this is tableUpdates, which maps[tableName]map[uuid]RowUpdate
 	var rowUpdates map[string]map[string]RowUpdate
 
 	b, err := json.Marshal(raw)
@@ -218,6 +225,46 @@ func update(client *rpc2.Client, params []interface{}, reply *interface{}) error
 
 	return nil
 }
+
+// RFC 7047 : Update Notification Section 4.1.6
+// Processing "params": [<json-value>, <table-updates>]
+func update2(client *rpc2.Client, params []interface{}, reply *interface{}) error {
+	if len(params) > 2 {
+		return fmt.Errorf("update requires exactly 2 args")
+	}
+	var updates TableUpdates2
+	err := json.Unmarshal(params[1].(json.RawMessage), &updates)
+	if err != nil {
+		return err
+	}
+
+	connectionsMutex.RLock()
+	defer connectionsMutex.RUnlock()
+	if _, ok := connections[client]; ok {
+		connections[client].handlersMutex.Lock()
+		defer connections[client].handlersMutex.Unlock()
+		for _, handler := range connections[client].handlers {
+			handler.Update2(params[0], updates)
+		}
+	}
+
+	return nil
+}
+
+func update3(client *rpc2.Client, params []interface{}, reply *interface{}) error {
+	if len(params) > 3 {
+		return fmt.Errorf("update3 requires exactly 3 args")
+	}
+	// TODO(trozet) figure out how to update ovndb to newest transaction
+	//currentTxn := params[1].(string)
+	newParams := []interface{}{params[0], params[2]}
+	err := update2(client, newParams, reply)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 
 // GetSchema returns the schema in use for the provided database name
 // RFC 7047 : get_schema
@@ -265,7 +312,7 @@ func (ovs OvsdbClient) Transact(database string, operation ...Operation) ([]Oper
 }
 
 // MonitorAll is a convenience method to monitor every table/column
-func (ovs OvsdbClient) MonitorAll(database string, jsonContext interface{}) (*TableUpdates, error) {
+func (ovs OvsdbClient) MonitorAll(database string, jsonContext interface{}) (*TableUpdates2, error) {
 	schema, ok := ovs.Schema[database]
 	if !ok {
 		return nil, fmt.Errorf("invalid Database %q Schema", database)
@@ -286,7 +333,8 @@ func (ovs OvsdbClient) MonitorAll(database string, jsonContext interface{}) (*Ta
 				Modify:  true,
 			}}
 	}
-	return ovs.Monitor(database, jsonContext, requests)
+	// not used dont care
+	return ovs.Monitor(database, jsonContext, requests, "00000000-0000-0000-0000-000000000000")
 }
 
 // MonitorCancel will request cancel a previously issued monitor request
@@ -308,19 +356,34 @@ func (ovs OvsdbClient) MonitorCancel(database string, jsonContext interface{}) e
 
 // Monitor will provide updates for a given table/column
 // RFC 7047 : monitor
-func (ovs OvsdbClient) Monitor(database string, jsonContext interface{}, requests map[string]MonitorRequest) (*TableUpdates, error) {
-	var reply TableUpdates
+func (ovs OvsdbClient) Monitor(database string, jsonContext interface{}, requests map[string]MonitorRequest, currrentTxn *string) (*TableUpdates2, error) {
+	var reply TableUpdates2
 
-	args := NewMonitorArgs(database, jsonContext, requests)
+	args := NewMonitorArgs(database, jsonContext, requests, currrentTxn)
 
-	// This totally sucks. Refer to golang JSON issue #6213
-	var response map[string]map[string]RowUpdate
-	err := ovs.rpcClient.Call("monitor", args, &response)
-	reply = getTableUpdatesFromRawUnmarshal(response)
-	if err != nil {
-		return nil, err
+	// TROZET  the response should be
+	//"result": [<found>, <last-txn-id>, <table-updates2>]
+	//"error": null
+	//"id": same "id" as request
+
+	// So..., map[result][found, last txn, tables2] something seems wrong here
+	var response map[string]map[string]map[string]RowUpdate2
+	type Respone {
+
 	}
-	return &reply, err
+	err := ovs.rpcClient.Call("monitor_cond_since", args, &response)
+
+	return response["result"], nil
+}
+
+func getTableUpdates2FromRawUnmarshal(raw map[string]map[string]RowUpdate2) TableUpdates2 {
+	var tableUpdates TableUpdates2
+	tableUpdates = make(map[string]TableUpdate2)
+	for table, update := range raw {
+		tableUpdate := TableUpdate2{update}
+		tableUpdates[table] = tableUpdate
+	}
+	return tableUpdates
 }
 
 func getTableUpdatesFromRawUnmarshal(raw map[string]map[string]RowUpdate) TableUpdates {

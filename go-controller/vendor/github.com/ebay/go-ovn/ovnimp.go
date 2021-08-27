@@ -221,6 +221,103 @@ func (odbi *ovndb) float64_to_int(row libovsdb.Row) {
 	}
 }
 
+func applyModifications(existing libovsdb.Row, update libovsdb.RealRow) (libovsdb.Row, error) {
+	for k, v := range update {
+		switch v.(type) {
+		case libovsdb.OvsSet:
+			nv := v.(libovsdb.OvsSet).GoSet
+			// The difference between two sets are all elements that only belong to one of the sets.
+
+			// Iterate new values
+			for i := 0; i < len(nv); i++ {
+
+				// search for match in base values
+				bVal, ok := existing.Fields[k]
+				if !ok {
+					// our cache didnt have the field, so just update it
+					existing.Fields[k] = nv
+				}
+				bv := bVal.(libovsdb.OvsSet).GoSet
+				var found bool
+				for j := 0; j < len(bv); j++ {
+					if bv[j] == nv[i] {
+						// found a match, delete from slice
+						found = true
+						newValue := append(bv[0:j], bv[j+1:len(bv)]...)
+						existing.Fields[k] = newValue
+						break
+					}
+				}
+				if !found {
+					newValue := append(bv[0:i],nv[i])
+					existing.Fields[k] = newValue
+				}
+			}
+
+		case libovsdb.OvsMap:
+			// The difference between two maps are all key-value pairs whose keys appears in only one of the maps,
+			// plus the key-value pairs whose keys appear in both maps but with different values.
+			// For the latter elements, <row> includes the value from the new column.
+			for mk, mv :=  range v.(libovsdb.OvsMap).GoMap {
+				mkVal := reflect.ValueOf(mk)
+				mvVal := reflect.ValueOf(mv)
+				bv := reflect.ValueOf(existing.Fields[k])
+
+				existingValue := bv.MapIndex(mkVal)
+
+				// key does not exist, add it
+				if !existingValue.IsValid() {
+					bv.SetMapIndex(mkVal, mvVal)
+				} else if reflect.DeepEqual(mvVal.Interface(), existingValue.Interface()) {
+					// delete it
+					bv.SetMapIndex(reflect.ValueOf(mk), reflect.Value{})
+				} else {
+					// set new value
+					bv.SetMapIndex(mkVal, mvVal)
+				}
+				existing.Fields[k] = bv.Interface()
+			}
+
+		default:
+			// For columns with single value, the difference is the value of the new column.
+			existing.Fields[k] = v
+		}
+	}
+	return existing, nil
+}
+
+func (odbi *ovndb) populateCache2(tableUpdates2 libovsdb.TableUpdates2) {
+	for table := range odbi.tableCols {
+		updates, ok := tableUpdates2[table]
+		if !ok {
+			continue
+		}
+		for uuid, row := range updates {
+			switch {
+			case row.Initial != nil:
+				// trozet (initial/insert will omit columns that are default values, do we care?)
+				odbi.cache[table][uuid] = libovsdb.Row{Fields: *row.Initial}
+
+			case row.Insert != nil:
+				odbi.cache[table][uuid] = libovsdb.Row{Fields: *row.Insert}
+			case row.Modify != nil:
+				existing, ok := odbi.cache[table][uuid]
+				if !ok {
+					panic(fmt.Errorf("row with uuid %s does not exist in cache for modify", uuid))
+				}
+
+				newRow, err :=  applyModifications(existing, *row.Modify)
+				if err != nil {
+					panic(err)
+				}
+				odbi.cache[table][uuid] = newRow
+			case row.Delete != nil:
+				delete(odbi.cache[table], uuid)
+			}
+		}
+	}
+}
+
 func (odbi *ovndb) populateCache(updates libovsdb.TableUpdates) {
 	empty := libovsdb.Row{}
 
