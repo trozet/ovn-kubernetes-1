@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	goovn "github.com/ebay/go-ovn"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/metrics"
@@ -95,11 +94,11 @@ func (oc *Controller) deleteLogicalPort(pod *kapi.Pod) {
 	portInfo, err := oc.logicalPortCache.get(logicalPort)
 	if err != nil {
 		klog.Errorf(err.Error())
-		// If ovnkube-master restarts, it is also possible the Pod's logical switch port
-		// is not readded into the cache. Delete logical switch port anyway.
-		err = util.OvnNBLSPDel(oc.ovnNBClient, logicalPort)
+		out, stderr, err := util.RunOVNNbctl("--if-exists", "lsp-del", logicalPort)
 		if err != nil {
-			klog.Errorf(err.Error())
+			klog.Errorf("Error in deleting pod %s logical port "+
+				"stdout: %q, stderr: %q, (%v)",
+				podDesc, out, stderr, err)
 		}
 
 		// Even if the port is not in the cache, IPs annotated in the Pod annotation may already be allocated,
@@ -121,9 +120,11 @@ func (oc *Controller) deleteLogicalPort(pod *kapi.Pod) {
 		klog.Errorf(err.Error())
 	}
 
-	err = util.OvnNBLSPDel(oc.ovnNBClient, logicalPort)
+	out, stderr, err := util.RunOVNNbctl("--if-exists", "lsp-del", logicalPort)
 	if err != nil {
-		klog.Errorf(err.Error())
+		klog.Errorf("Error in deleting pod %s logical port "+
+			"stdout: %q, stderr: %q, (%v)",
+			podDesc, out, stderr, err)
 	}
 
 	if err := oc.lsManager.ReleaseIPs(portInfo.logicalSwitch, portInfo.ips); err != nil {
@@ -262,58 +263,31 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 
 	var podMac net.HardwareAddr
 	var podIfAddrs []*net.IPNet
-	var cmds []*goovn.OvnCommand
 	var addresses []string
-	var cmd *goovn.OvnCommand
 	var releaseIPs bool
 	needsIP := true
-
-	// Check if the pod's logical switch port already exists. If it
-	// does don't re-add the port to OVN as this will change its
-	// UUID and and the port cache, address sets, and port groups
-	// will still have the old UUID.
-	lsp, err := oc.ovnNBClient.LSPGet(portName)
-	if err != nil && err != goovn.ErrorNotFound && err != goovn.ErrorSchema {
-		return fmt.Errorf("unable to get the lsp: %s from the nbdb: %s", portName, err)
-	}
+	var args []string
 
 	// Bind the port to the node's chassis; prevents ping-ponging between
 	// chassis if ovnkube-node isn't running correctly and hasn't cleared
 	// out iface-id for an old instance of this pod, and the pod got
 	// rescheduled.
-	opts, err := oc.ovnNBClient.LSPGetOptions(portName)
-	if err != nil && err != goovn.ErrorNotFound {
-		klog.Warningf("Failed to get options for port %s: %v", portName, err)
-	}
-	if opts == nil {
-		opts = make(map[string]string)
-	}
-	opts["requested-chassis"] = pod.Spec.NodeName
+	opts := []string{"--", "lsp-set-options", portName, fmt.Sprintf("requested-chassis=%s", pod.Spec.NodeName)}
 
-	if lsp == nil {
-		cmd, err = oc.ovnNBClient.LSPAdd(logicalSwitch, portName)
-		if err != nil {
-			return fmt.Errorf("unable to create the LSPAdd command for port: %s from the nbdb: %v", portName, err)
-		}
-		cmds = append(cmds, cmd)
-		// Unique identifier to distinguish interfaces for recreated pods, also set by ovnkube-node
-		// ovn-controller will claim the OVS interface only if external_ids:iface-id
-		// matches with the Port_Binding.logical_port and external_ids:iface-id-ver matches
-		// with the Port_Binding.options:iface-id-ver. This is not mandatory.
-		// If Port_binding.options:iface-id-ver is not set, then OVS
-		// Interface.external_ids:iface-id-ver if set is ignored.
-		// Only set for new LSP for correct ovn-kube upgrade, because for old OVS Interfaces
-		// iface-id-ver is not set => ovn-controller won't bind OVS Interface
-		opts["iface-id-ver"] = string(pod.UID)
+	// Check if the pod's logical switch port already exists. If it
+	// does don't re-add the port to OVN as this will change its
+	// UUID and and the port cache, address sets, and port groups
+	// will still have the old UUID.
+	out, _, err := util.RunOVNNbctl("--if-exists", "get", "logical_switch_port", portName, "_uuid")
+	if err != nil || !strings.Contains(out, "-") {
+		// Pod's logical switch port does not yet exist
+		args = []string{"lsp-add", logicalSwitch, portName}
+		opts = append(opts, fmt.Sprintf("iface-id-ver=%s", pod.UID))
 	} else {
 		klog.Infof("LSP already exists for port: %s", portName)
 	}
 
-	cmd, err = oc.ovnNBClient.LSPSetOptions(portName, opts)
-	if err != nil {
-		return fmt.Errorf("unable to create the LSPSetOptions command for port: %s from the nbdb: %v", portName, err)
-	}
-	cmds = append(cmds, cmd)
+	args = append(args, opts...)
 
 	annotation, err := util.UnmarshalPodAnnotation(pod.Annotations)
 
@@ -345,11 +319,7 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 
 		// If the pod already has annotations use the existing static
 		// IP/MAC from the annotation.
-		cmd, err = oc.ovnNBClient.LSPSetDynamicAddresses(portName, "")
-		if err != nil {
-			return fmt.Errorf("unable to create LSPSetDynamicAddresses command for port: %s", portName)
-		}
-		cmds = append(cmds, cmd)
+		args = append(args, "--", "--if-exists", "clear", "logical_switch_port", portName, "dynamic_addresses")
 
 		// ensure we have reserved the IPs in the annotation
 		if err = oc.lsManager.AllocateIPs(logicalSwitch, podIfAddrs); err != nil && err != ipallocator.ErrAllocated {
@@ -486,43 +456,39 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 	}
 
 	// LSP addresses in OVN are a single space-separated value
-	cmd, err = oc.ovnNBClient.LSPSetAddress(portName, strings.Join(addresses, " "))
-	if err != nil {
-		return fmt.Errorf("unable to create LSPSetAddress command for port: %s", portName)
-	}
-	cmds = append(cmds, cmd)
+	args = append(args, "--", "lsp-set-addresses", portName, strings.Join(addresses, " "))
 
 	// add external ids
-	extIds := map[string]string{"namespace": pod.Namespace, "pod": "true"}
-	cmd, err = oc.ovnNBClient.LSPSetExternalIds(portName, extIds)
-	if err != nil {
-		return fmt.Errorf("unable to create LSPSetExternalIds command for port: %s", portName)
-	}
-	cmds = append(cmds, cmd)
+	args = append(args, "--", "set", "logical_switch_port", portName, "external-ids:namespace="+pod.Namespace, "external-ids:pod=true")
 
 	// CNI depends on the flows from port security, delay setting it until end
-	cmd, err = oc.ovnNBClient.LSPSetPortSecurity(portName, strings.Join(addresses, " "))
+	args = append(args, "--", "lsp-set-port-security", portName, strings.Join(addresses, " "))
+
+	// execute all the commands together.
+	var stderr string
+	out, stderr, err = util.RunOVNNbctl(args...)
 	if err != nil {
-		return fmt.Errorf("unable to create LSPSetPortSecurity command for port: %s", portName)
+		return fmt.Errorf("error while creating logical port %s stdout: %q, stderr: %q (%v)",
+			portName, out, stderr, err)
 	}
 
-	cmds = append(cmds, cmd)
-
-	// execute all the commands together. If a single operation fails, all commands will roll back =>
-	// for new Pod no LSP will be created
-	err = oc.ovnNBClient.Execute(cmds...)
+	// UUID must be retrieved separately from the lsp-add transaction since
+	// (as of OVN 2.12) a bogus UUID is returned if they are part of the same
+	// transaction.
+	// FIXME: move to the lsp-add transaction once https://bugzilla.redhat.com/show_bug.cgi?id=1806788
+	// is resolved.
+	var uuid string
+	uuid, stderr, err = util.RunOVNNbctl("get", "logical_switch_port", portName, "_uuid")
 	if err != nil {
-		return fmt.Errorf("error while creating logical port %s error: %v",
-			portName, err)
+		return fmt.Errorf("error while getting UUID for logical port %s "+
+			"stdout: %q, stderr: %q (%v)", portName, uuid, stderr, err)
 	}
-
-	lsp, err = oc.ovnNBClient.LSPGet(portName)
-	if err != nil || lsp == nil {
-		return fmt.Errorf("failed to get the logical switch port: %s from the ovn client, error: %s", portName, err)
+	if !strings.Contains(uuid, "-") {
+		return fmt.Errorf("invalid logical port %s uuid %q", portName, uuid)
 	}
 
 	// Add the pod's logical switch port to the port cache
-	portInfo := oc.logicalPortCache.add(logicalSwitch, portName, lsp.UUID, podMac, podIfAddrs)
+	portInfo := oc.logicalPortCache.add(logicalSwitch, portName, uuid, podMac, podIfAddrs)
 
 	// If multicast is allowed and enabled for the namespace, add the port to the allow policy.
 	// FIXME: there's a race here with the Namespace multicastUpdateNamespace() handler, but
