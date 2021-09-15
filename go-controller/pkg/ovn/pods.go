@@ -86,15 +86,21 @@ func (oc *Controller) deleteLogicalPort(pod *kapi.Pod) {
 	if pod.Spec.HostNetwork {
 		return
 	}
-
+	start := time.Now()
+	var ovnExecuteTime time.Duration
 	podDesc := pod.Namespace + "/" + pod.Name
 	klog.Infof("Deleting pod: %s", podDesc)
+	defer func() {
+		klog.Infof("[%s/%s] deleteLogicalPort took %v, OVN Execute time %v", pod.Namespace, pod.Name, time.Since(start), ovnExecuteTime)
+	}()
 
 	logicalPort := podLogicalPortName(pod)
 	portInfo, err := oc.logicalPortCache.get(logicalPort)
 	if err != nil {
 		klog.Errorf(err.Error())
+		start1 := time.Now()
 		out, stderr, err := util.RunOVNNbctl("--if-exists", "lsp-del", logicalPort)
+		ovnExecuteTime = time.Since(start1)
 		if err != nil {
 			klog.Errorf("Error in deleting pod %s logical port "+
 				"stdout: %q, stderr: %q, (%v)",
@@ -123,7 +129,9 @@ func (oc *Controller) deleteLogicalPort(pod *kapi.Pod) {
 	}
 	ops = append(ops, delCmd...)
 
+	start1 := time.Now()
 	out, stderr, err := util.RunOVNNbctl(ops...)
+	ovnExecuteTime = time.Since(start1)
 	if err != nil {
 		klog.Errorf("Error in deleting pod %s logical port "+
 			"stdout: %q, stderr: %q, (%v)",
@@ -249,10 +257,13 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 		return nil
 	}
 
+	var ovnExecuteTime time.Duration
+	var podAnnoTime time.Duration
 	// Keep track of how long syncs take.
 	start := time.Now()
 	defer func() {
-		klog.Infof("[%s/%s] addLogicalPort took %v", pod.Namespace, pod.Name, time.Since(start))
+		klog.Infof("[%s/%s] addLogicalPort took %v, OVN Execute time %v, pod Annotation time: %v",
+			pod.Namespace, pod.Name, time.Since(start), ovnExecuteTime, podAnnoTime)
 	}()
 
 	logicalSwitch := pod.Spec.NodeName
@@ -423,7 +434,10 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 
 		klog.V(5).Infof("Annotation values: ip=%v ; mac=%s ; gw=%s\nAnnotation=%s",
 			podIfAddrs, podMac, podAnnotation.Gateways, marshalledAnnotation)
-		if err = oc.kube.SetAnnotationsOnPod(pod.Namespace, pod.Name, marshalledAnnotation); err != nil {
+		annoStart := time.Now()
+		err = oc.kube.SetAnnotationsOnPod(pod.Namespace, pod.Name, marshalledAnnotation)
+		podAnnoTime = time.Since(annoStart)
+		if err != nil {
 			return fmt.Errorf("failed to set annotation on pod %s: %v", pod.Name, err)
 		}
 		releaseIPs = false
@@ -478,10 +492,12 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 	// CNI depends on the flows from port security, delay setting it until end
 	args = append(args, "--", "lsp-set-port-security", portName, strings.Join(addresses, " "))
 
+	start1 := time.Now()
 	// execute all the commands together.
 	var stderr string
 	out, stderr, err = util.RunOVNNbctl(args...)
 	if err != nil {
+		ovnExecuteTime = time.Since(start1)
 		return fmt.Errorf("error while creating logical port %s stdout: %q, stderr: %q (%v)",
 			portName, out, stderr, err)
 	}
@@ -493,6 +509,7 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 	// is resolved.
 	var uuid string
 	uuid, stderr, err = util.RunOVNNbctl("get", "logical_switch_port", portName, "_uuid")
+	ovnExecuteTime = time.Since(start1)
 	if err != nil {
 		return fmt.Errorf("error while getting UUID for logical port %s "+
 			"stdout: %q, stderr: %q (%v)", portName, uuid, stderr, err)
