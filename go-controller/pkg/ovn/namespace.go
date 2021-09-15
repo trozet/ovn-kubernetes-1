@@ -78,42 +78,39 @@ func (oc *Controller) getRoutingPodGWs(nsInfo *namespaceInfo) map[string]*gatewa
 
 // addPodToNamespace adds the pod's IP to the namespace's address set and returns
 // pod's routing gateway info
-func (oc *Controller) addPodToNamespace(ns string, ips []*net.IPNet) (*gatewayInfo, map[string]*gatewayInfo, net.IP, error) {
+func (oc *Controller) addPodToNamespace(ns string, ips []*net.IPNet) (*gatewayInfo, map[string]*gatewayInfo, net.IP, []string, error) {
 	nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(ns, true)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to ensure namespace locked: %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("failed to ensure namespace locked: %v", err)
 	}
 
 	defer nsUnlock()
 
-	if err := nsInfo.addressSet.AddIPs(createIPAddressSlice(ips)); err != nil {
-		return nil, nil, nil, err
-	}
+	addrSetCmd := nsInfo.addressSet.PrepareAddIPsCmds(createIPAddressSlice(ips))
 
-	return oc.getRoutingExternalGWs(nsInfo), oc.getRoutingPodGWs(nsInfo), nsInfo.hybridOverlayExternalGW, nil
+	return oc.getRoutingExternalGWs(nsInfo), oc.getRoutingPodGWs(nsInfo), nsInfo.hybridOverlayExternalGW, addrSetCmd, nil
 }
 
-func (oc *Controller) deletePodFromNamespace(ns, name, uuid string, ips []*net.IPNet) error {
+func (oc *Controller) deletePodFromNamespace(ns, name, uuid string, ips []*net.IPNet) ([]string, error) {
+	var delCmd []string
 	nsInfo, nsUnlock := oc.getNamespaceLocked(ns, true)
 	if nsInfo == nil {
-		return nil
+		return delCmd, nil
 	}
 	defer nsUnlock()
 
 	if nsInfo.addressSet != nil && len(ips) > 0 {
-		if err := nsInfo.addressSet.DeleteIPs(createIPAddressSlice(ips)); err != nil {
-			return err
-		}
+		delCmd = nsInfo.addressSet.PrepareDelIPsCmds(createIPAddressSlice(ips))
 	}
 
 	// Remove the port from the multicast allow policy.
 	if oc.multicastSupport && nsInfo.multicastEnabled && uuid != "" {
 		if err := podDeleteAllowMulticastPolicy(oc.ovnNBClient, ns, name, uuid); err != nil {
-			return err
+			return delCmd, err
 		}
 	}
 
-	return nil
+	return delCmd, nil
 }
 
 func createIPAddressSlice(ips []*net.IPNet) []net.IP {

@@ -232,6 +232,14 @@ func (as *fakeAddressSets) GetName() string {
 	return as.name
 }
 
+func (as *fakeAddressSets) PrepareAddIPsCmds(ip []net.IP) []string {
+	return nil
+}
+
+func (as *fakeAddressSets) PrepareDelIPsCmds(ip []net.IP) []string {
+	return nil
+}
+
 func (as *fakeAddressSets) AddIPs(ips []net.IP) error {
 	var err error
 	as.Lock()

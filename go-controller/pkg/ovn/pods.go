@@ -116,11 +116,14 @@ func (oc *Controller) deleteLogicalPort(pod *kapi.Pod) {
 
 	// FIXME: if any of these steps fails we need to stop and try again later...
 
-	if err := oc.deletePodFromNamespace(pod.Namespace, portInfo.name, portInfo.uuid, portInfo.ips); err != nil {
+	ops := []string{"--if-exists", "lsp-del", logicalPort}
+	delCmd, err := oc.deletePodFromNamespace(pod.Namespace, portInfo.name, portInfo.uuid, portInfo.ips)
+	if err != nil {
 		klog.Errorf(err.Error())
 	}
+	ops = append(ops, delCmd...)
 
-	out, stderr, err := util.RunOVNNbctl("--if-exists", "lsp-del", logicalPort)
+	out, stderr, err := util.RunOVNNbctl(ops...)
 	if err != nil {
 		klog.Errorf("Error in deleting pod %s logical port "+
 			"stdout: %q, stderr: %q, (%v)",
@@ -307,8 +310,17 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 			} else {
 				klog.Infof("Released IPs: %s for node: %s", util.JoinIPNetIPs(podIfAddrs, " "), logicalSwitch)
 			}
-			if nsErr := oc.deletePodFromNamespace(pod.Namespace, portName, "", podIfAddrs); nsErr != nil {
+			delCmds, nsErr := oc.deletePodFromNamespace(pod.Namespace, portName, "", podIfAddrs)
+			if nsErr != nil {
 				klog.Errorf("Error when deleting pod: %s from namespace: %v", pod.Name, err)
+			}
+			if len(delCmds) > 0 {
+				_, stderr, err := util.RunOVNNbctl(delCmds...)
+				if err != nil {
+					klog.Errorf("Error when removing pod %s ips from address set "+
+						"stdout: %q, stderr: %q, (%v)",
+						fmt.Sprintf("%s_%s", pod.Namespace, pod.Name), stderr, err)
+				}
 			}
 		}
 	}()
@@ -360,10 +372,12 @@ func (oc *Controller) addLogicalPort(pod *kapi.Pod) (err error) {
 	}
 
 	// Ensure the namespace/nsInfo exists
-	routingExternalGWs, routingPodGWs, hybridOverlayExternalGW, err := oc.addPodToNamespace(pod.Namespace, podIfAddrs)
+	routingExternalGWs, routingPodGWs, hybridOverlayExternalGW, addrSetCmd, err := oc.addPodToNamespace(pod.Namespace, podIfAddrs)
 	if err != nil {
 		return err
 	}
+
+	args = append(args, addrSetCmd...)
 
 	if needsIP {
 		var networks []*types.NetworkSelectionElement

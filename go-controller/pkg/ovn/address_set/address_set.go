@@ -51,9 +51,12 @@ type AddressSet interface {
 	GetName() string
 	// AddIPs adds the array of IPs to the address set
 	AddIPs(ip []net.IP) error
+	// PrepareAddIPsCmds generates the nbctl command to add ips
+	PrepareAddIPsCmds(ip []net.IP) []string
 	// SetIPs sets the address set to the given array of addresses
 	SetIPs(ip []net.IP) error
 	DeleteIPs(ip []net.IP) error
+	PrepareDelIPsCmds(ip []net.IP) []string
 	Destroy() error
 }
 
@@ -361,6 +364,46 @@ func (as *ovnAddressSets) AddIPs(ips []net.IP) error {
 	return nil
 }
 
+func (as *ovnAddressSets) PrepareAddIPsCmds(ips []net.IP) []string {
+	var cmds []string
+	if len(ips) == 0 {
+		return cmds
+	}
+
+	as.RLock()
+	defer as.RUnlock()
+
+	v4ips, v6ips := splitIPsByFamily(ips)
+	if as.ipv6 != nil {
+		cmds = append(cmds, as.ipv6.addIPsCmd(v6ips)...)
+	}
+	if as.ipv4 != nil {
+		cmds = append(cmds, as.ipv4.addIPsCmd(v4ips)...)
+	}
+
+	return cmds
+}
+
+func (as *ovnAddressSets) PrepareDelIPsCmds(ips []net.IP) []string {
+	var cmds []string
+	if len(ips) == 0 {
+		return cmds
+	}
+
+	as.RLock()
+	defer as.RUnlock()
+
+	v4ips, v6ips := splitIPsByFamily(ips)
+	if as.ipv6 != nil {
+		cmds = append(cmds, as.ipv6.delIPsCmd(v6ips)...)
+	}
+	if as.ipv4 != nil {
+		cmds = append(cmds, as.ipv4.delIPsCmd(v4ips)...)
+	}
+
+	return cmds
+}
+
 func (as *ovnAddressSets) DeleteIPs(ips []net.IP) error {
 	if len(ips) == 0 {
 		return nil
@@ -439,6 +482,30 @@ func (as *ovnAddressSet) addIPs(ips []net.IP) error {
 	}
 
 	return nil
+}
+
+// addIPsCmd appends the set of IPs to the existing address_set and returns the cmd.
+func (as *ovnAddressSet) addIPsCmd(ips []net.IP) []string {
+	if len(ips) == 0 {
+		return nil
+	}
+
+	ipStr := joinIPs(ips)
+
+	klog.V(5).Infof("(%s) adding IPs (%s) to address set command", asDetail(as), ipStr)
+	return []string{"--", "add", "address_set", as.uuid, "addresses", ipStr}
+}
+
+// addIPsCmd appends the set of IPs to the existing address_set and returns the cmd.
+func (as *ovnAddressSet) delIPsCmd(ips []net.IP) []string {
+	if len(ips) == 0 {
+		return nil
+	}
+
+	ipStr := joinIPs(ips)
+
+	klog.V(5).Infof("(%s) deleting IPs (%s) to address set command", asDetail(as), ipStr)
+	return []string{"--", "remove", "address_set", as.uuid, "addresses", ipStr}
 }
 
 // deleteIPs removes selected IPs from the existing address_set
