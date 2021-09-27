@@ -397,7 +397,6 @@ func (oc *Controller) deleteNamespace(ns *kapi.Namespace) {
 		delete(nsInfo.networkPolicies, np.name)
 		oc.destroyNetworkPolicy(np, nsInfo)
 	}
-	oc.deleteGWRoutesForNamespace(nsInfo)
 	oc.multicastDeleteNamespace(ns, nsInfo)
 }
 
