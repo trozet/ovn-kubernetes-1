@@ -84,10 +84,6 @@ type namespaceInfo struct {
 	// routingExternalGWs is a slice of net.IP containing the values parsed from
 	// annotation k8s.ovn.org/routing-external-gws
 	routingExternalGWs gatewayInfo
-	// podExternalRoutes is a cache keeping the LR routes added to the GRs when
-	// the k8s.ovn.org/routing-external-gws annotation is used. The first map key
-	// is the podIP, the second the GW and the third the GR
-	podExternalRoutes map[string]map[string]string
 
 	// routingExternalPodGWs contains a map of all pods serving as exgws as well as their
 	// exgw IPs

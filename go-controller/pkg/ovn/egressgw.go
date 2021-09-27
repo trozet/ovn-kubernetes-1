@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	utilnet "k8s.io/utils/net"
@@ -17,6 +18,7 @@ import (
 	nettypes "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 
 	kapi "k8s.io/api/core/v1"
+	ktypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 )
 
@@ -37,6 +39,139 @@ type ovnRoute struct {
 	router      string
 	outport     string
 	shouldExist bool
+}
+
+type externalRouteInfo struct {
+	sync.RWMutex
+	// podExternalRoutes is a cache keeping the LR routes added to the GRs when
+	// the k8s.ovn.org/routing-external-gws annotation is used. The first map key
+	// is the podIP, the second the GW and the third the GR
+	routes map[string]map[string]string
+}
+
+var egressGWCache struct {
+	sync.RWMutex
+	routeInfo map[ktypes.NamespacedName]*externalRouteInfo
+}
+
+func ensureRouteInfoLocked(podName ktypes.NamespacedName, readOnly bool) (*externalRouteInfo, func(), error) {
+	egressGWCache.Lock()
+	routeInfo := egressGWCache.routeInfo[podName]
+	routeInfoExisted := false
+	if routeInfo == nil {
+		routeInfo = &externalRouteInfo{
+			routes: make(map[string]map[string]string),
+		}
+		// we are creating routeInfo and going to set it in podExternalRoutes map
+		// so safe to hold the lock while we create and add it
+		defer egressGWCache.Unlock()
+		egressGWCache.routeInfo[podName] = routeInfo
+	} else {
+		routeInfoExisted = true
+		// if we found and existing nsInfo, do not hold the namespaces lock
+		// while waiting for nsInfo to Lock
+		egressGWCache.Unlock()
+	}
+
+	var unlockFunc func()
+	if readOnly {
+		unlockFunc = routeInfo.RUnlock
+		routeInfo.RLock()
+	} else {
+		unlockFunc = routeInfo.Unlock
+		routeInfo.Lock()
+	}
+
+	if routeInfoExisted {
+		// Check that the namespace wasn't deleted while we were waiting for the lock
+		egressGWCache.Lock()
+		defer egressGWCache.Unlock()
+		if routeInfo != egressGWCache.routeInfo[podName] {
+			unlockFunc()
+			return nil, nil, fmt.Errorf("pod %s, was removed during ensure route info", podName)
+		}
+	}
+
+	return routeInfo, unlockFunc, nil
+}
+
+func getRouteInfosForGateway(gatewayIP, namespace string) []*externalRouteInfo {
+	egressGWCache.RLock()
+	defer egressGWCache.RUnlock()
+
+	routes := make([]*externalRouteInfo, 0)
+	for namespacedName, routeInfo := range egressGWCache.routeInfo {
+		if namespacedName.Namespace != namespace {
+			continue
+		}
+
+		for _, route := range routeInfo.routes {
+			if _, ok := route[gatewayIP]; ok {
+				routeInfo.Lock()
+				routes = append(routes, routeInfo)
+			}
+		}
+	}
+
+	return routes
+}
+
+func getRouteInfosForNamespace(namespace string) []*externalRouteInfo {
+	egressGWCache.RLock()
+	defer egressGWCache.RUnlock()
+
+	routes := make([]*externalRouteInfo, 0)
+	for namespacedName, routeInfo := range egressGWCache.routeInfo {
+		if namespacedName.Namespace != namespace {
+			continue
+		}
+		routeInfo.Lock()
+		routes = append(routes, routeInfo)
+	}
+
+	return routes
+}
+
+func getRouteInfosForPodIP(namespace, podIP string) []*externalRouteInfo {
+	egressGWCache.RLock()
+	defer egressGWCache.RUnlock()
+
+	routes := make([]*externalRouteInfo, 0)
+	for namespacedName, routeInfo := range egressGWCache.routeInfo {
+		if namespacedName.Namespace != namespace {
+			continue
+		}
+		for ip := range routeInfo.routes {
+			if ip == podIP {
+				routeInfo.Lock()
+				routes = append(routes, routeInfo)
+			}
+		}
+	}
+
+	return routes
+}
+
+func deleteRouteInfoLocked(name ktypes.NamespacedName) *externalRouteInfo {
+	egressGWCache.Lock()
+	routeInfo := egressGWCache.routeInfo[name]
+	egressGWCache.Unlock()
+
+	if routeInfo == nil {
+		return nil
+	}
+	routeInfo.Lock()
+
+	egressGWCache.Lock()
+	defer egressGWCache.Unlock()
+	if routeInfo != egressGWCache.routeInfo[name] {
+		routeInfo.Unlock()
+		return nil
+	}
+
+	delete(egressGWCache.routeInfo, name)
+
+	return routeInfo
 }
 
 // addPodExternalGW handles detecting if a pod is serving as an external gateway for namespace(s) and adding routes
@@ -84,13 +219,7 @@ func (oc *Controller) addPodExternalGWForNamespace(namespace string, pod *kapi.P
 	}
 	klog.Infof("Adding routes for external gateway pod: %s, next hops: %q, namespace: %s, bfd-enabled: %t",
 		pod.Name, gws, namespace, egress.bfdEnabled)
-	nsInfo, nsUnlock, err := oc.ensureNamespaceLocked(namespace, false)
-	if err != nil {
-		return fmt.Errorf("failed to ensure namespace locked: %v", err)
-	}
-	defer nsUnlock()
-	nsInfo.routingExternalPodGWs[pod.Name] = egress
-	return oc.addGWRoutesForNamespace(namespace, egress, nsInfo)
+	return oc.addGWRoutesForNamespace(namespace, egress)
 }
 
 // addExternalGWsForNamespace handles adding annotated gw routes to all pods in namespace
@@ -100,18 +229,23 @@ func (oc *Controller) addExternalGWsForNamespace(egress gatewayInfo, nsInfo *nam
 		return fmt.Errorf("unable to add gateways routes for namespace: %s, gateways are nil", namespace)
 	}
 	nsInfo.routingExternalGWs = egress
-	return oc.addGWRoutesForNamespace(namespace, egress, nsInfo)
+	return oc.addGWRoutesForNamespace(namespace, egress)
 }
 
 // addGWRoutesForNamespace handles adding routes for all existing pods in namespace
 // This should only be called with a lock on nsInfo
-func (oc *Controller) addGWRoutesForNamespace(namespace string, egress gatewayInfo, nsInfo *namespaceInfo) error {
+func (oc *Controller) addGWRoutesForNamespace(namespace string, egress gatewayInfo) error {
 	existingPods, err := oc.watchFactory.GetPods(namespace)
 	if err != nil {
 		return fmt.Errorf("failed to get all the pods (%v)", err)
 	}
 	// TODO (trozet): use the go bindings here and batch commands
 	for _, pod := range existingPods {
+		podNsName := ktypes.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+		routeInfo, routeUnlock, err := ensureRouteInfoLocked(podNsName, false)
+		if err != nil {
+			return fmt.Errorf("failed to get routeInfo lock for pod: %s, error: %v", pod.Name, err)
+		}
 		if config.Gateway.DisableSNATMultipleGWs {
 			logicalPort := podLogicalPortName(pod)
 			portInfo, err := oc.logicalPortCache.get(logicalPort)
@@ -125,6 +259,7 @@ func (oc *Controller) addGWRoutesForNamespace(namespace string, egress gatewayIn
 		prefix, err := oc.extSwitchPrefix(pod.Spec.NodeName)
 		if err != nil {
 			klog.Infof("Failed to find ext switch prefix for %s %v", pod.Spec.NodeName, err)
+			routeUnlock()
 			continue
 		}
 
@@ -136,7 +271,7 @@ func (oc *Controller) addGWRoutesForNamespace(namespace string, egress gatewayIn
 				}
 
 				// if route was already programmed, skip it
-				if foundGR, ok := nsInfo.podExternalRoutes[podIP.IP][gw.String()]; ok && foundGR == gr {
+				if foundGR, ok := routeInfo.routes[podIP.IP][gw.String()]; ok && foundGR == gr {
 					continue
 				}
 
@@ -151,17 +286,17 @@ func (oc *Controller) addGWRoutesForNamespace(namespace string, egress gatewayIn
 				_, stderr, err := util.RunOVNNbctl(nbctlArgs...)
 
 				if err != nil && !strings.Contains(stderr, DuplicateECMPError) {
+					routeUnlock()
 					return fmt.Errorf("unable to add src-ip route to GR router, stderr:%q, err:%v", stderr, err)
 				}
 				if err := oc.addHybridRoutePolicyForPod(net.ParseIP(podIP.IP), pod.Spec.NodeName); err != nil {
+					routeUnlock()
 					return err
 				}
-				if nsInfo.podExternalRoutes[podIP.IP] == nil {
-					nsInfo.podExternalRoutes[podIP.IP] = make(map[string]string)
-				}
-				nsInfo.podExternalRoutes[podIP.IP][gw.String()] = gr
+				routeInfo.routes[podIP.IP][gw.String()] = gr
 			}
 		}
+		routeUnlock()
 	}
 	return nil
 }
@@ -182,13 +317,15 @@ func (oc *Controller) deletePodExternalGW(pod *kapi.Pod) {
 
 // deletePodGwRoutesForNamespace handles deleting all routes in a namespace for a specific pod GW
 func (oc *Controller) deletePodGWRoutesForNamespace(pod, namespace string) {
-	nsInfo, nsUnlock := oc.getNamespaceLocked(namespace, false)
+	nsInfo, nsUnlock := oc.getNamespaceLocked(namespace, true)
 	if nsInfo == nil {
 		return
 	}
-	defer nsUnlock()
 	// check if any gateways were stored for this pod
 	foundGws, ok := nsInfo.routingExternalPodGWs[pod]
+	delete(nsInfo.routingExternalPodGWs, pod)
+	nsUnlock()
+
 	if !ok || len(foundGws.gws) == 0 {
 		klog.Infof("No gateways found to remove for annotated gateway pod: %s on namespace: %s",
 			pod, namespace)
@@ -197,99 +334,102 @@ func (oc *Controller) deletePodGWRoutesForNamespace(pod, namespace string) {
 
 	for _, gwIP := range foundGws.gws {
 		// check for previously configured pod routes
-		for podIP, gwInfo := range nsInfo.podExternalRoutes {
-			if len(gwInfo) == 0 {
-				continue
-			}
-			gr := gwInfo[gwIP.String()]
-			if gr == "" {
-				continue
-			}
-			mask := GetIPFullMask(podIP)
-			node := util.GetWorkerFromGatewayRouter(gr)
-			portPrefix, err := oc.extSwitchPrefix(node)
-			if err != nil {
-				klog.Infof("Failed to find ext switch prefix for %s %v", node, err)
-				continue
-			}
-
-			_, stderr, err := util.RunOVNNbctl("--if-exists", "--policy=src-ip",
-				"lr-route-del", gr, podIP+mask, gwIP.String())
-			if err != nil {
-				klog.Errorf("Unable to delete pod %s route to GR %s, GW: %s, stderr:%q, err:%v",
-					pod, gr, gwIP.String(), stderr, err)
-			} else {
-				klog.V(5).Infof("ECMP route deleted for pod: %s, on gr: %s, to gw: %s", pod,
-					gr, gwIP.String())
-				delete(nsInfo.podExternalRoutes[podIP], gwIP.String())
-				// clean up if there are no more routes for this podIP
-				if entry := nsInfo.podExternalRoutes[podIP]; len(entry) == 0 {
-					delete(nsInfo.podExternalRoutes, podIP)
-					// TODO (trozet): use the go bindings here and batch commands
-					// delete the ovn_cluster_router policy if the pod has no more exgws to revert back to normal
-					// default gw behavior
-					if err := oc.delHybridRoutePolicyForPod(net.ParseIP(podIP), node, false); err != nil {
-						klog.Error(err)
+		routeInfos := getRouteInfosForGateway(gwIP.String(), namespace)
+		for _, routeInfo := range routeInfos {
+			for podIP, route := range routeInfo.routes {
+				for routeGwIP, gr := range route {
+					if gwIP.String() != routeGwIP {
+						continue
 					}
+					if gr == "" {
+						continue
+					}
+					mask := GetIPFullMask(podIP)
+					node := util.GetWorkerFromGatewayRouter(gr)
+					portPrefix, err := oc.extSwitchPrefix(node)
+					if err != nil {
+						klog.Infof("Failed to find ext switch prefix for %s %v", node, err)
+						continue
+					}
+
+					_, stderr, err := util.RunOVNNbctl("--if-exists", "--policy=src-ip",
+						"lr-route-del", gr, podIP+mask, gwIP.String())
+					if err != nil {
+						klog.Errorf("Unable to delete pod %s route to GR %s, GW: %s, stderr:%q, err:%v",
+							pod, gr, gwIP.String(), stderr, err)
+					} else {
+						klog.V(5).Infof("ECMP route deleted for pod: %s, on gr: %s, to gw: %s", pod,
+							gr, gwIP.String())
+
+						delete(routeInfo.routes[podIP], gwIP.String())
+						// clean up if there are no more routes for this podIP
+						if entry := routeInfo.routes[podIP]; len(entry) == 0 {
+							// TODO (trozet): use the go bindings here and batch commands
+							// delete the ovn_cluster_router policy if the pod has no more exgws to revert back to normal
+							// default gw behavior
+							if err := oc.delHybridRoutePolicyForPod(net.ParseIP(podIP), node, false); err != nil {
+								klog.Error(err)
+							}
+						}
+					}
+					cleanUpBFDEntry(gwIP.String(), gr, portPrefix)
 				}
 			}
-			cleanUpBFDEntry(gwIP.String(), gr, portPrefix)
+			routeInfo.Unlock()
 		}
 	}
-	delete(nsInfo.routingExternalPodGWs, pod)
 }
 
 // deleteGwRoutesForNamespace handles deleting all routes to gateways for a pod on a specific GR
 // This should only be called with a lock on nsInfo
-func (oc *Controller) deleteGWRoutesForNamespace(nsInfo *namespaceInfo) {
-	if nsInfo == nil {
-		return
-	}
+func (oc *Controller) deleteGWRoutesForNamespace(namespace string) {
 
 	// TODO(trozet): batch all of these with ebay bindings
-	for podIP, gwToGr := range nsInfo.podExternalRoutes {
-		for gw, gr := range gwToGr {
-			if utilnet.IsIPv6String(gw) != utilnet.IsIPv6String(podIP) {
-				continue
-			}
-			mask := GetIPFullMask(podIP)
-			node := util.GetWorkerFromGatewayRouter(gr)
-			if err := oc.delHybridRoutePolicyForPod(net.ParseIP(podIP), node, false); err != nil {
-				klog.Error(err)
-			}
-			_, stderr, err := util.RunOVNNbctl("--if-exists", "--policy=src-ip",
-				"lr-route-del", gr, podIP+mask, gw)
-			if err != nil {
-				klog.Errorf("Unable to delete src-ip route to GR router, stderr:%q, err:%v", stderr, err)
-			} else {
-				delete(nsInfo.podExternalRoutes, podIP)
-			}
+	routeInfos := getRouteInfosForNamespace(namespace)
+	for _, routeInfo := range routeInfos {
+		for podIP, gwToGr := range routeInfo.routes {
+			for gw, gr := range gwToGr {
+				if utilnet.IsIPv6String(gw) != utilnet.IsIPv6String(podIP) {
+					continue
+				}
+				mask := GetIPFullMask(podIP)
+				node := util.GetWorkerFromGatewayRouter(gr)
+				if err := oc.delHybridRoutePolicyForPod(net.ParseIP(podIP), node, false); err != nil {
+					klog.Error(err)
+				}
+				_, stderr, err := util.RunOVNNbctl("--if-exists", "--policy=src-ip",
+					"lr-route-del", gr, podIP+mask, gw)
+				if err != nil {
+					klog.Errorf("Unable to delete src-ip route to GR router, stderr:%q, err:%v", stderr, err)
+				} else {
+					delete(routeInfo.routes, podIP)
+				}
 
-			portPrefix, err := oc.extSwitchPrefix(node)
-			if err != nil {
-				klog.Infof("Failed to find ext switch prefix for %s %v", node, err)
-				continue
+				portPrefix, err := oc.extSwitchPrefix(node)
+				if err != nil {
+					klog.Infof("Failed to find ext switch prefix for %s %v", node, err)
+					continue
+				}
+				cleanUpBFDEntry(gw, gr, portPrefix)
 			}
-			cleanUpBFDEntry(gw, gr, portPrefix)
 		}
+		routeInfo.Unlock()
 	}
-	nsInfo.routingExternalGWs = gatewayInfo{}
 }
 
 // deleteGwRoutesForPod handles deleting all routes to gateways for a pod IP on a specific GR
-func (oc *Controller) deleteGWRoutesForPod(namespace string, podIPNets []*net.IPNet) {
-	// delete src-ip cached route to GR
-	nsInfo, nsUnlock := oc.getNamespaceLocked(namespace, false)
-	if nsInfo == nil {
+func (oc *Controller) deleteGWRoutesForPod(name ktypes.NamespacedName, podIPNets []*net.IPNet) {
+	routeInfo := deleteRouteInfoLocked(name)
+	if routeInfo == nil {
 		return
 	}
-	defer nsUnlock()
+	defer routeInfo.Unlock()
 
 	for _, podIPNet := range podIPNets {
 		pod := podIPNet.IP.String()
-		if gwToGr, ok := nsInfo.podExternalRoutes[pod]; ok {
+		if gwToGr, ok := routeInfo.routes[pod]; ok {
 			if len(gwToGr) == 0 {
-				delete(nsInfo.podExternalRoutes, pod)
+				delete(routeInfo.routes, pod)
 				return
 			}
 			mask := GetIPFullMask(pod)
@@ -309,7 +449,7 @@ func (oc *Controller) deleteGWRoutesForPod(namespace string, podIPNets []*net.IP
 				if err != nil {
 					klog.Errorf("Unable to delete external gw ecmp route to GR router, stderr:%q, err:%v", stderr, err)
 				} else {
-					delete(nsInfo.podExternalRoutes, pod)
+					delete(routeInfo.routes, pod)
 				}
 				cleanUpBFDEntry(gw, gr, portPrefix)
 			}
@@ -319,11 +459,6 @@ func (oc *Controller) deleteGWRoutesForPod(namespace string, podIPNets []*net.IP
 
 // addEgressGwRoutesForPod handles adding all routes to gateways for a pod on a specific GR
 func (oc *Controller) addGWRoutesForPod(gateways []*gatewayInfo, podIfAddrs []*net.IPNet, namespace, node string) error {
-	nsInfo, nsUnlock := oc.getNamespaceLocked(namespace, false)
-	if nsInfo == nil {
-		return fmt.Errorf("unable to get namespace: %s", namespace)
-	}
-	defer nsUnlock()
 	gr := util.GetGatewayRouterFromNode(node)
 
 	routesAdded := 0
@@ -336,43 +471,52 @@ func (oc *Controller) addGWRoutesForPod(gateways []*gatewayInfo, podIfAddrs []*n
 	port := portPrefix + types.GWRouterToExtSwitchPrefix + gr
 
 	for _, podIPNet := range podIfAddrs {
-		for _, gateway := range gateways {
-			// TODO (trozet): use the go bindings here and batch commands
-			// validate the ip and gateway belong to the same address family
-			gws, err := util.MatchIPFamily(utilnet.IsIPv6(podIPNet.IP), gateway.gws)
-			if err == nil {
-				podIP := podIPNet.IP.String()
-				for _, gw := range gws {
-					gwStr := gw.String()
-					// if route was already programmed, skip it
-					if foundGR, ok := nsInfo.podExternalRoutes[podIP][gwStr]; ok && foundGR == gr {
-						routesAdded++
-						continue
-					}
-					mask := GetIPFullMask(podIP)
-					nbctlArgs := []string{"--may-exist", "--policy=src-ip", "--ecmp-symmetric-reply",
-						"lr-route-add", gr, podIP + mask, gw.String(), port}
-					if gateway.bfdEnabled {
-						nbctlArgs = []string{"--may-exist", "--bfd", "--policy=src-ip", "--ecmp-symmetric-reply",
+		pod := podIPNet.IP.String()
+		routeInfos := getRouteInfosForPodIP(namespace, pod)
+		var gwError error
+		for _, routeInfo := range routeInfos {
+			for _, gateway := range gateways {
+				// TODO (trozet): use the go bindings here and batch commands
+				// validate the ip and gateway belong to the same address family
+				gws, err := util.MatchIPFamily(utilnet.IsIPv6(podIPNet.IP), gateway.gws)
+				if err == nil {
+					podIP := podIPNet.IP.String()
+					for _, gw := range gws {
+						gwStr := gw.String()
+						// if route was already programmed, skip it
+						if foundGR, ok := routeInfo.routes[podIP][gwStr]; ok && foundGR == gr {
+							routesAdded++
+							continue
+						}
+						mask := GetIPFullMask(podIP)
+						nbctlArgs := []string{"--may-exist", "--policy=src-ip", "--ecmp-symmetric-reply",
 							"lr-route-add", gr, podIP + mask, gw.String(), port}
+						if gateway.bfdEnabled {
+							nbctlArgs = []string{"--may-exist", "--bfd", "--policy=src-ip", "--ecmp-symmetric-reply",
+								"lr-route-add", gr, podIP + mask, gw.String(), port}
+						}
+						_, stderr, err := util.RunOVNNbctl(nbctlArgs...)
+						if err != nil && !strings.Contains(stderr, DuplicateECMPError) {
+							gwError = fmt.Errorf("unable to add external gwStr src-ip route to GR router, stderr:%q, err:%gw", stderr, err)
+							continue
+						}
+						if err := oc.addHybridRoutePolicyForPod(podIPNet.IP, node); err != nil {
+							return err
+						}
+						if routeInfo.routes[podIP] == nil {
+							routeInfo.routes[podIP] = make(map[string]string)
+						}
+						routeInfo.routes[podIP][gwStr] = gr
+						routesAdded++
 					}
-					_, stderr, err := util.RunOVNNbctl(nbctlArgs...)
-					if err != nil && !strings.Contains(stderr, DuplicateECMPError) {
-						return fmt.Errorf("unable to add external gwStr src-ip route to GR router, stderr:%q, err:%gw", stderr, err)
-					}
-					if err := oc.addHybridRoutePolicyForPod(podIPNet.IP, node); err != nil {
-						return err
-					}
-					if nsInfo.podExternalRoutes[podIP] == nil {
-						nsInfo.podExternalRoutes[podIP] = make(map[string]string)
-					}
-					nsInfo.podExternalRoutes[podIP][gwStr] = gr
-					routesAdded++
+				} else {
+					klog.Warningf("Address families for the pod address %s and gateway %s did not match", podIPNet.IP.String(), gateway.gws)
 				}
-			} else {
-				klog.Warningf("Address families for the pod address %s and gateway %s did not match", podIPNet.IP.String(), gateway.gws)
 			}
-
+			routeInfo.Unlock()
+		}
+		if gwError != nil {
+			return gwError
 		}
 	}
 	// if no routes are added return an error
