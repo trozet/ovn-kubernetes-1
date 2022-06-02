@@ -502,6 +502,14 @@ var _ = ginkgo.Describe("Gateway Init Operations", func() {
 				Name: types.ClusterLBGroupName,
 				UUID: types.ClusterLBGroupName + "-UUID",
 			}
+			var v int
+			v = 5
+			trozetLogicalSwitchPort := &nbdb.LogicalSwitchPort{
+				Name: "br-ex1_worker-23",
+				Type: "localnet",
+				TagRequest: &v,
+
+			}
 			fakeOvn.startWithDBSetup(libovsdbtest.TestSetup{
 				NBData: []libovsdbtest.TestData{
 					// tests migration from shared to local
@@ -514,6 +522,7 @@ var _ = ginkgo.Describe("Gateway Init Operations", func() {
 					expectedOVNClusterRouter,
 					expectedNodeSwitch,
 					expectedClusterLBGroup,
+					trozetLogicalSwitchPort,
 				},
 			})
 
@@ -522,6 +531,8 @@ var _ = ginkgo.Describe("Gateway Init Operations", func() {
 			joinLRPIPs := ovntest.MustParseIPNets("100.64.0.3/16", "fd98::3/64")
 			defLRPIPs := ovntest.MustParseIPNets("100.64.0.1/16", "fd98::1/64")
 			nodeName := "test-node"
+			var b uint
+			b = 0
 			l3GatewayConfig := &util.L3GatewayConfig{
 				Mode:           config.GatewayModeLocal,
 				ChassisID:      "SYSTEM-ID",
@@ -529,6 +540,10 @@ var _ = ginkgo.Describe("Gateway Init Operations", func() {
 				MACAddress:     ovntest.MustParseMAC("11:22:33:44:55:66"),
 				IPAddresses:    ovntest.MustParseIPNets("169.254.33.2/24", "fd99::2/64"),
 				NextHops:       ovntest.MustParseIPs("169.254.33.1", "fd99::1"),
+				EgressGWInterfaceID: "br-ex1_worker-23",
+				EgressGWIPAddresses: ovntest.MustParseIPNets("198.19.2.240/19", "fd13:f100:e876::b7cb/64"),
+				EgressGWMACAddress: ovntest.MustParseMAC("b8:59:9f:d9:c8:19"),
+				VLANID: &b,
 				NodePortEnable: true,
 			}
 			sctpSupport := false

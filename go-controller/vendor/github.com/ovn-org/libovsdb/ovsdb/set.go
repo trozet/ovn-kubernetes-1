@@ -43,6 +43,7 @@ func NewOvsSet(obj interface{}) (OvsSet, error) {
 			return OvsSet{}, fmt.Errorf("ovsset supports only go slice/string/numbers/uuid or pointers to those types")
 		}
 	default:
+		fmt.Println(v.Kind())
 		return OvsSet{}, fmt.Errorf("ovsset supports only go slice/string/numbers/uuid or pointers to those types")
 	}
 	return OvsSet{ovsSet}, nil
